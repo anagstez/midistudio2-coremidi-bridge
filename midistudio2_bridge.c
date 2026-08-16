@@ -55,6 +55,7 @@
 #define PRODUCT_ID  0x2202
 #define READ_TIMEOUT_MS 1000
 #define READ_BUF_SIZE   64   /* типовий wMaxPacketSize для old-school int/bulk EP */
+#define RECONNECT_WAIT_US 500000
 
 static volatile sig_atomic_t g_running = 1;
 static void on_sigint(int sig) { (void)sig; g_running = 0; }
@@ -155,19 +156,25 @@ static int find_endpoint_by_pipe_index(libusb_device *dev, usb_ctx_t *ctx, int w
     return -1;
 }
 
+static void usb_close(usb_ctx_t *ctx)
+{
+    if (!ctx || !ctx->handle) {
+        return;
+    }
+    libusb_release_interface(ctx->handle, ctx->iface_num);
+    libusb_close(ctx->handle);
+    ctx->handle = NULL;
+}
+
+/* libusb_init має бути викликаний один раз у main. Відсутній пристрій —
+ * не помилка: caller чекає і пробує знову. Інші збої логуються. */
 static int usb_open(usb_ctx_t *ctx, int pipe_index, int force_ep_addr)
 {
+    usb_close(ctx);
     memset(ctx, 0, sizeof(*ctx));
-
-    if (libusb_init(NULL) != 0) {
-        fprintf(stderr, "libusb_init failed\n");
-        return -1;
-    }
 
     libusb_device_handle *h = libusb_open_device_with_vid_pid(NULL, VENDOR_ID, PRODUCT_ID);
     if (!h) {
-        fprintf(stderr, "Пристрій VID_%04x&PID_%04x не знайдено. Підключений?\n",
-                VENDOR_ID, PRODUCT_ID);
         return -1;
     }
     ctx->handle = h;
@@ -176,8 +183,12 @@ static int usb_open(usb_ctx_t *ctx, int pipe_index, int force_ep_addr)
 
     if (force_ep_addr >= 0) {
         /* ручний override: --ep=0x82 */
-        struct libusb_config_descriptor *cfg;
-        libusb_get_active_config_descriptor(dev, &cfg);
+        struct libusb_config_descriptor *cfg = NULL;
+        if (libusb_get_active_config_descriptor(dev, &cfg) != 0 || !cfg) {
+            fprintf(stderr, "Не вдалось прочитати config descriptor.\n");
+            usb_close(ctx);
+            return -1;
+        }
         int found = 0;
         for (int i = 0; i < cfg->bNumInterfaces && !found; i++) {
             const struct libusb_interface *iface = &cfg->interface[i];
@@ -199,10 +210,12 @@ static int usb_open(usb_ctx_t *ctx, int pipe_index, int force_ep_addr)
         libusb_free_config_descriptor(cfg);
         if (!found) {
             fprintf(stderr, "Ендпоінт 0x%02x не знайдено в дескрипторі.\n", force_ep_addr);
+            usb_close(ctx);
             return -1;
         }
     } else if (find_endpoint_by_pipe_index(dev, ctx, pipe_index) != 0) {
         fprintf(stderr, "Не вдалось знайти пайп з індексом %d.\n", pipe_index);
+        usb_close(ctx);
         return -1;
     }
 
@@ -211,6 +224,7 @@ static int usb_open(usb_ctx_t *ctx, int pipe_index, int force_ep_addr)
     }
     if (libusb_claim_interface(h, ctx->iface_num) != 0) {
         fprintf(stderr, "Не вдалось claim_interface(%d). Перевір права доступу.\n", ctx->iface_num);
+        usb_close(ctx);
         return -1;
     }
 
@@ -273,6 +287,29 @@ static void handle_event_bytes(const unsigned char *ev, MIDIEndpointRef src)
     }
 }
 
+/* Після unplug нота може лишитись затиснутою в DAW. */
+static void panic_hanging_notes(MIDIEndpointRef src)
+{
+    if (!src) {
+        return;
+    }
+    for (int ch = 0; ch < 16; ch++) {
+        unsigned char msgs[2][3] = {
+            { (unsigned char)(0xB0 | ch), 123, 0 }, /* All Notes Off */
+            { (unsigned char)(0xB0 | ch), 120, 0 }, /* All Sound Off */
+        };
+        for (int i = 0; i < 2; i++) {
+            Byte packetBuf[128];
+            MIDIPacketList *pktlist = (MIDIPacketList *)packetBuf;
+            MIDIPacket *pkt = MIDIPacketListInit(pktlist);
+            pkt = MIDIPacketListAdd(pktlist, sizeof(packetBuf), pkt, 0, 3, msgs[i]);
+            if (pkt) {
+                MIDIReceived(src, pktlist);
+            }
+        }
+    }
+}
+
 int main(int argc, char **argv)
 {
     int dump_only  = 0;
@@ -288,6 +325,7 @@ int main(int argc, char **argv)
     }
 
     signal(SIGINT, on_sigint);
+    signal(SIGTERM, on_sigint);
 
     if (describe) {
         if (libusb_init(NULL) != 0) { fprintf(stderr, "libusb_init failed\n"); return 1; }
@@ -299,10 +337,13 @@ int main(int argc, char **argv)
         return 0;
     }
 
-    usb_ctx_t ctx;
-    if (usb_open(&ctx, pipe_index, force_ep) != 0) {
+    if (libusb_init(NULL) != 0) {
+        fprintf(stderr, "libusb_init failed\n");
         return 1;
     }
+
+    usb_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
 
     MIDIClientRef client = 0;
     MIDIEndpointRef src = 0;
@@ -317,8 +358,29 @@ int main(int argc, char **argv)
 
     unsigned char buf[READ_BUF_SIZE];
     int timeout_count = 0;
+    int ever_connected = 0;
+    int waiting_logged = 0;
 
     while (g_running) {
+        if (!ctx.handle) {
+            if (usb_open(&ctx, pipe_index, force_ep) != 0) {
+                if (!waiting_logged) {
+                    fprintf(stderr,
+                            "Чекаю MidiStudio-2 (VID_%04x&PID_%04x). Підключи клавіатуру.\n",
+                            VENDOR_ID, PRODUCT_ID);
+                    waiting_logged = 1;
+                }
+                usleep(RECONNECT_WAIT_US);
+                continue;
+            }
+            if (ever_connected) {
+                fprintf(stderr, "USB reconnect успішний.\n");
+            }
+            ever_connected = 1;
+            waiting_logged = 0;
+            timeout_count = 0;
+        }
+
         int actual = 0;
         int r = usb_read(&ctx, buf, sizeof(buf), &actual);
 
@@ -330,10 +392,16 @@ int main(int argc, char **argv)
             }
             continue;
         }
+        if (r == LIBUSB_ERROR_INTERRUPTED) {
+            continue;
+        }
         timeout_count = 0;
         if (r != 0) {
-            fprintf(stderr, "USB read error: %s\n", libusb_error_name(r));
-            usleep(200000);
+            fprintf(stderr, "USB %s — чекаю reconnect.\n", libusb_error_name(r));
+            panic_hanging_notes(src);
+            usb_close(&ctx);
+            waiting_logged = 0;
+            usleep(RECONNECT_WAIT_US);
             continue;
         }
         if (actual <= 0) {
@@ -354,9 +422,9 @@ int main(int argc, char **argv)
     }
 
     fprintf(stderr, "Завершення...\n");
+    panic_hanging_notes(src);
+    usb_close(&ctx);
     if (client) MIDIClientDispose(client);
-    libusb_release_interface(ctx.handle, ctx.iface_num);
-    libusb_close(ctx.handle);
     libusb_exit(NULL);
     return 0;
 }

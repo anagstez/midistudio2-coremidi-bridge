@@ -110,6 +110,11 @@ clang -O2 -o midistudio2_bridge midistudio2_bridge.c \
 Після запуску без прапорців пристрій з'явиться як віртуальне MIDI-джерело
 **"MidiStudio-2"** в Audio MIDI Setup / будь-якому DAW.
 
+Міст можна запускати без клавіатури: він чекає USB-пристрій і сам
+підхоплює його після unplug/replug. Віртуальне CoreMIDI-джерело при
+цьому не знищується. На від’єднанні надсилається All Notes Off / All
+Sound Off, щоб у DAW не лишались завислих нот.
+
 ## Права доступу
 
 Звичайний user-space USB-доступ через libusb/IOKit на macOS не потребує
